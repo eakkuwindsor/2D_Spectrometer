@@ -4,11 +4,20 @@ import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
+import matplotlib.pyplot as plt
 
 MODEL_PATH = os.path.join("interferogram_model", "interferogram_cnn.pth")
 PRED_DIR   = os.path.join("datasets", "prediction_dataset")
 LABELS_CSV = os.path.join(PRED_DIR, "labels.csv")
-OUT_CSV    = os.path.join(PRED_DIR, "results.csv")
+
+# New output folder inside prediction_dataset
+RESULTS_DIR = os.path.join(PRED_DIR, "results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+OUT_CSV   = os.path.join(RESULTS_DIR, "results.csv")
+ACC_PNG   = os.path.join(RESULTS_DIR, "accuracy_bar.png")
+PROB_PNG  = os.path.join(RESULTS_DIR, "prob_histograms.png")
+MIS_PNG   = os.path.join(RESULTS_DIR, "misclassified_grid.png")
 
 ID_TO_MATERIAL = {0: "BK7", 1: "FS", 2: "CaF2"}
 
@@ -39,6 +48,64 @@ def load_image_tensor(path, normalize=True):
 
     return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
 
+def plot_accuracy_bars(overall_acc: float, per_class_acc: np.ndarray, class_names, out_path: str):
+    labels = ["Overall"] + list(class_names)
+    values = [overall_acc] + per_class_acc.tolist()
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.bar(labels, values)
+    ax.set_ylim(0, 1.0)
+    ax.set_title("Accuracy")
+    ax.set_ylabel("Accuracy (0–1)")
+
+    for i, v in enumerate(values):
+        ax.text(i, v + 0.02, f"{v:.3f}", ha="center", va="bottom")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+def plot_prob_histograms(probs_max: np.ndarray, correct_mask: np.ndarray, out_path: str):
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.hist(probs_max[correct_mask], bins=20, alpha=0.7, label="Correct")
+    ax.hist(probs_max[~correct_mask], bins=20, alpha=0.7, label="Incorrect")
+    ax.set_title("Model Confidence (max softmax probability)")
+    ax.set_xlabel("Max Probability")
+    ax.set_ylabel("Count")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+def plot_misclassified_grid(mis_paths, mis_titles, out_path: str, max_images=12):
+    if len(mis_paths) == 0:
+        return
+    n = min(max_images, len(mis_paths))
+    cols = 4
+    rows = int(np.ceil(n / cols))
+
+    fig, axes = plt.subplots(rows, cols, figsize=(12, 3 * rows))
+    if rows == 1:
+        axes = np.array(axes).reshape(1, -1)
+
+    for idx in range(rows * cols):
+        r = idx // cols
+        c = idx % cols
+        ax = axes[r, c]
+        ax.axis("off")
+
+        if idx >= n:
+            continue
+
+        img = Image.open(mis_paths[idx]).convert("L")
+        ax.imshow(np.array(img), cmap="gray")
+        ax.set_title(mis_titles[idx], fontsize=9)
+
+    fig.suptitle("Misclassified Examples", y=1.02)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
 def main():
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(f"Missing model: {MODEL_PATH} (train first)")
@@ -55,6 +122,16 @@ def main():
 
     total = 0
     correct = 0
+
+    num_classes = 3
+    per_class_total = np.zeros(num_classes, dtype=int)
+    per_class_correct = np.zeros(num_classes, dtype=int)
+
+    per_sample_maxprob = []
+    per_sample_correct = []
+
+    mis_paths = []
+    mis_titles = []
 
     with open(OUT_CSV, "w", newline="") as out_f:
         w = csv.writer(out_f)
@@ -87,6 +164,16 @@ def main():
             total += 1
             correct += is_correct
 
+            per_class_total[true_id] += 1
+            per_class_correct[true_id] += is_correct
+
+            per_sample_maxprob.append(float(np.max(probs)))
+            per_sample_correct.append(bool(is_correct))
+
+            if not is_correct:
+                mis_paths.append(img_path)
+                mis_titles.append(f"{fname}\ntrue={true_mat} pred={pred_mat}")
+
             print(f"{fname} | true={true_mat} pred={pred_mat} {'✓' if is_correct else '✗'}")
 
             w.writerow([
@@ -96,8 +183,32 @@ def main():
             ])
 
     acc = correct / total if total else 0.0
+    per_class_acc = np.array([
+        (per_class_correct[i] / per_class_total[i]) if per_class_total[i] > 0 else 0.0
+        for i in range(num_classes)
+    ], dtype=float)
+
+    class_names = [ID_TO_MATERIAL[i] for i in range(num_classes)]
+
     print(f"\nTotal: {total}  Correct: {correct}  Accuracy: {acc:.3f}")
     print("Wrote ->", OUT_CSV)
+
+    # Save plots into results/
+    plot_accuracy_bars(acc, per_class_acc, class_names, ACC_PNG)
+
+    probs_max = np.array(per_sample_maxprob, dtype=float)
+    correct_mask = np.array(per_sample_correct, dtype=bool)
+    plot_prob_histograms(probs_max, correct_mask, PROB_PNG)
+
+    plot_misclassified_grid(mis_paths, mis_titles, MIS_PNG, max_images=12)
+
+    print("\nSaved in ->", RESULTS_DIR)
+    print(" ", ACC_PNG)
+    print(" ", PROB_PNG)
+    if len(mis_paths) > 0:
+        print(" ", MIS_PNG)
+    else:
+        print(" (No misclassifications, so no misclassified_grid.png)")
 
 if __name__ == "__main__":
     main()
